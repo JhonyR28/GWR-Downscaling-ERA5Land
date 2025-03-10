@@ -1,0 +1,315 @@
+---
+title: "GWR for Grid Downscalling ERA5"
+output: html_notebook
+---
+
+```{r}
+# Cargar librerías necesarias
+library(terra)            # Manejo de rasters
+library(sf)               # Manejo de shapefiles
+library(dplyr)            # Manipulación de datos
+library(rgeoboundaries)   # Descarga de límites administrativos
+
+# 📌 1. Definir carpeta donde están los archivos TIF
+tif_folder <- "D:/TIFS/ASTGTM_003-20250309_171438"
+
+# 📌 2. Listar todos los archivos .tif en la carpeta
+tif_files <- list.files(tif_folder, pattern = "\\.tif$", full.names = TRUE)
+
+# 📌 3. Leer y unir los archivos TIF en un solo mosaico
+mosaico <- do.call(merge, lapply(tif_files, rast))
+
+# 📌 4. Descargar los límites administrativos de nivel 1 para Perú
+peru_departamentos <- rgeoboundaries::gb_adm1("PER")
+
+# 📌 5. Filtrar solo el departamento de La Libertad (evitando problemas con espacios y mayúsculas)
+nombre_departamento <- "La Libertad"
+la_libertad_sf <- peru_departamentos %>%
+  dplyr::filter(tolower(trimws(shapeName)) == tolower(nombre_departamento))
+
+# 📌 6. Convertir el shapefile de La Libertad a SpatVector para compatibilidad con terra
+la_libertad_vect <- vect(la_libertad_sf)
+
+# 📌 7. Recortar y enmascarar el raster con el shapefile de La Libertad
+mosaico_recortado <- crop(mosaico, la_libertad_vect)  # Recorta el área
+mosaico_final <- mask(mosaico_recortado, la_libertad_vect)  # Aplica máscara
+
+# 📌 8. Guardar el raster final
+writeRaster(mosaico_final, "D:/TIFS/mosaico_la_libertad.tif", overwrite = TRUE)
+
+# 📌 9. Guardar el shapefile de La Libertad
+ruta_shapefile <- "D:/TIFS/la_libertad.shp"
+st_write(la_libertad_sf, ruta_shapefile, driver = "ESRI Shapefile", delete_layer = TRUE)
+
+# 📌 10. Visualizar el resultado
+plot(mosaico_final)
+
+# 📌 10. Mensaje final
+cat("✅ Proceso completado. El raster recortado se ha guardado en 'D:/TIFS/mosaico_la_libertad.tif' 🎉")
+
+```
+```{python}
+import xarray as xr
+import rioxarray as rio
+import geopandas as gpd
+import numpy as np
+from rasterio.enums import Resampling
+import math
+
+# Rutas de los archivos
+nc_file = "D:/TIFS/datos_20_enero.nc"             # Archivo NetCDF original (horario)
+shapefile = "D:/TIFS/la_libertad.shp"             # Shapefile del área de interés
+output_nc = "D:/TIFS/datos_20_enero_recortado.nc" # Archivo de salida con ETo, precip diaria y humedad absoluta
+
+# 1. Cargar el dataset NetCDF
+ds = xr.open_dataset(nc_file)
+
+# 2. Cargar el shapefile y transformar a CRS WGS84 (EPSG:4326)
+shp = gpd.read_file(shapefile)
+shp = shp.to_crs("EPSG:4326")
+
+# 3. Ajustar el CRS del dataset y recortarlo con el shapefile
+ds = ds.rio.write_crs("EPSG:4326")
+ds = ds.rio.clip(shp.geometry, shp.crs)
+
+#--------------------------------------------------------------------------
+# 4. Conversión de unidades y cálculos básicos
+#--------------------------------------------------------------------------
+# a) Temperaturas de Kelvin a Celsius
+ds["t2m"] = ds["t2m"] - 273.15     # Temp. aire 2m (°C)
+ds["d2m"] = ds["d2m"] - 273.15     # Temp. rocío 2m (°C)
+
+# b) Velocidad del viento (magnitud) a 10 m
+ds["wind_10m"] = np.sqrt(ds["u10"]**2 + ds["v10"]**2)
+
+# c) Conversión de la velocidad de 10 m -> 2 m (FAO-56 ~0.75)
+conversion_factor = 4.87 / np.log(67.8 * 10.0 - 5.42)
+ds["wind_2m"] = ds["wind_10m"] * conversion_factor
+
+# d) Presión superficial de Pa a kPa
+ds["sp"] = ds["sp"] / 1000.0  # [kPa]
+
+#--------------------------------------------------------------------------
+# 5. Calcular precipitación diaria a partir de la acumulada por hora
+#--------------------------------------------------------------------------
+# 'tp' en ERA5 suele ser precip acumulada (en metros de agua) desde el inicio del forecast.
+# (a) Diferencia entre pasos para obtener lluvia "horaria":
+tp_incremental = ds["tp"].diff(dim="valid_time", label="upper")
+
+# Forzamos a 0 si hay valores negativos (reinicios de forecast)
+tp_incremental = tp_incremental.where(tp_incremental > 0, 0)
+
+# (b) Sumamos por día
+ds_daily_precip = tp_incremental.resample(valid_time="1D").sum()
+
+# (c) Convertimos a mm
+ds_daily_precip_mm = ds_daily_precip * 1000.0
+ds_daily_precip_mm.name = "tp_daily_mm"
+
+#--------------------------------------------------------------------------
+# 6. Resample diario de variables meteorológicas
+#--------------------------------------------------------------------------
+# - Para variables instantáneas/continuas (T, viento, etc.) = promedio diario
+ds_daily = ds.resample(valid_time="1D").mean()
+
+# - Radiación neta (ssr, str) = sum (acumuladas)
+ds_daily["ssr"] = ds["ssr"].resample(valid_time="1D").sum()
+ds_daily["str"] = ds["str"].resample(valid_time="1D").sum()
+
+# - Temperatura máxima y mínima
+ds_daily["t2m_max"] = ds["t2m"].resample(valid_time="1D").max()
+ds_daily["t2m_min"] = ds["t2m"].resample(valid_time="1D").min()
+
+#--------------------------------------------------------------------------
+# 7. Variables de apoyo para FAO-56
+#--------------------------------------------------------------------------
+ds_daily["t2m_mean"] = (ds_daily["t2m_max"] + ds_daily["t2m_min"]) / 2
+
+e0_max = 0.6108 * np.exp((17.27 * ds_daily["t2m_max"]) / (ds_daily["t2m_max"] + 237.3))
+e0_min = 0.6108 * np.exp((17.27 * ds_daily["t2m_min"]) / (ds_daily["t2m_min"] + 237.3))
+ds_daily["e0"] = (e0_max + e0_min) / 2  # [kPa]
+
+ds_daily["d2m_mean"] = ds["d2m"].resample(valid_time="1D").mean()
+ea = 0.6108 * np.exp((17.27 * ds_daily["d2m_mean"]) / (ds_daily["d2m_mean"] + 237.3))
+ds_daily["ea"] = ea
+
+ds_daily["RH"] = (ds_daily["ea"] / ds_daily["e0"]) * 100.0
+ds_daily["wind_2m"] = ds_daily["wind_2m"].clip(min=0.1)
+
+ds_daily["delta"] = (4098.0 * ds_daily["e0"]) / ((ds_daily["t2m_mean"] + 237.3)**2)
+ds_daily["gamma"] = 0.000665 * ds_daily["sp"]
+
+#--------------------------------------------------------------------------
+# 8. Radiación neta y ETo FAO-56
+#--------------------------------------------------------------------------
+ds_daily["Rn"] = (ds_daily["ssr"] + ds_daily["str"]) / 1e6  # [MJ/m²/día]
+
+ds_daily["ETo"] = (
+    (0.408 * ds_daily["delta"] * ds_daily["Rn"]) +
+    (ds_daily["gamma"] * (900.0 / (ds_daily["t2m_mean"] + 273.0))
+     * ds_daily["wind_2m"] * (ds_daily["e0"] - ds_daily["ea"]))
+) / (ds_daily["delta"] + ds_daily["gamma"] * (1.0 + 0.34 * ds_daily["wind_2m"]))
+
+#--------------------------------------------------------------------------
+# 9. Unir precipitación diaria (mm) al dataset diario
+#--------------------------------------------------------------------------
+ds_daily["tp_daily_mm"] = ds_daily_precip_mm
+
+#--------------------------------------------------------------------------
+# 9.bis. Calcular humedad absoluta (densidad de vapor en g/m³)
+#--------------------------------------------------------------------------
+# Usamos la fórmula: rho_v = (ea (Pa)) / (R_v * T(K))  [kg/m³],
+# y luego multiplicamos *1000 para pasar a g/m³.
+# Donde ea está en kPa -> pasamos a Pa multiplicando por 1000.
+# T está en °C -> sumamos 273.15 para Kelvin.
+# R_v ~ 461.5 J/(kg*K).
+
+ea_pa = ds_daily["ea"] * 1000.0  # kPa -> Pa
+temp_k = ds_daily["t2m_mean"] + 273.15
+Rv = 461.5  # J/(kg*K)
+# kg/m³ -> g/m³
+ds_daily["abs_hum"] = (ea_pa / (Rv * temp_k)) * 1000.0
+
+# Añadimos atributos opcionales
+ds_daily["abs_hum"].attrs["units"] = "g m^-3"
+ds_daily["abs_hum"].attrs["long_name"] = "Absolute humidity (water vapor density)"
+
+#--------------------------------------------------------------------------
+# 10. Guardar resultado a NetCDF
+#--------------------------------------------------------------------------
+ds_daily.to_netcdf(output_nc)
+print("✅ Archivo NetCDF diario con ETo, precipitación y humedad absoluta guardado en:", output_nc)
+
+```
+
+```{python}
+import xarray as xr
+
+# Supongamos que 'ds_daily' es tu dataset final con dimensión 'valid_time',
+# y que sólo tiene 1 día (valid_time=0), o eliges uno en particular.
+# Asegúrate de que ds_daily ya tenga su CRS escrito:
+ds_daily = ds_daily.rio.write_crs("EPSG:4326")
+
+# Lista de variables que deseas exportar
+var_list = [
+    "t2m_mean",
+    "RH",
+    "tp_daily_mm",
+    "Rn",
+    "ETo",
+    "abs_hum",
+    "wind_2m"
+]
+
+# Si sólo tienes 1 día, extraemos el único slice:
+# (si tu dataset tuviera N días, podrías recorrer cada uno en un bucle)
+day_index = 0
+
+for var_name in var_list:
+    # Seleccionar la variable y el día (para que sea 2D: lat, lon)
+    da_2d = ds_daily[var_name].isel(valid_time=day_index)
+    
+    # Opcional: Asegúrate de que la variable tenga CRS
+    da_2d = da_2d.rio.write_crs("EPSG:4326")
+    
+    # Exportar a GeoTIFF
+    output_path = f"D:/TIFS/{var_name}.tif"
+    da_2d.rio.to_raster(output_path)
+
+    print(f"Guardado: {output_path}")
+
+```
+
+
+
+```{r}
+install.packages("RSAGA")
+library(RSAGA)
+library(terra)   # para plot/rast
+library(glue)
+library(purrr)
+
+# Configurar entorno SAGA GIS
+# Cambia path según dónde instalaste SAGA 8.x
+envr <- rsaga.env(path = "C:/Program Files/SAGA")
+
+# Lista todos los módulos disponibles en la librería "statistics_regression"
+rsaga.get.modules("statistics_regression", env = envr)
+```
+```{r}
+rsaga.get.usage(
+  lib    = "statistics_regression", 
+  module = 14,
+  env    = envr
+)
+
+```
+
+
+```{r}
+library(RSAGA)
+library(terra)
+library(glue)
+library(purrr)
+
+envr <- rsaga.env(path = "C:/Program Files/SAGA")
+
+# Lista de TIFs dependientes (los que queremos reescalar)
+fles <- c(
+  "D:/TIFS/t2m_mean.tif",
+  "D:/TIFS/RH.tif",
+  "D:/TIFS/tp_daily_mm.tif",
+  "D:/TIFS/Rn.tif",
+  "D:/TIFS/ETo.tif",
+  "D:/TIFS/abs_hum.tif",
+  "D:/TIFS/wind_2m.tif"
+)
+
+# DEM / Predictor principal
+dem_path <- "D:/TIFS/mosaico_la_libertad.tif"
+
+# Aplicar la herramienta GWR a cada variable
+purrr::map(
+  .x = seq_along(fles),
+  .f = function(i) {
+    finp <- fles[i]
+    # Salida: mismo nombre pero con prefijo "downscaled_"
+    fout <- glue("D:/TIFS/downscaled_{basename(finp)}")
+    
+    cat("Processing layer #", i, ":\n",
+        "DEPENDENT  = ", finp, "\n",
+        "PREDICTORS = ", dem_path, "\n",
+        "OUTPUT     = ", fout, "\n\n")
+    
+    rsl <- rsaga.geoprocessor(
+      lib    = "statistics_regression",
+      module = "GWR for Grid Downscaling",
+      param  = list(
+        DEPENDENT    = finp,                           # Variable dependiente (TIF de tu variable)
+        PREDICTORS   = dem_path,                       # Raster predictor (DEM)
+        REGRESSION   = fout,                           # Salida principal de la regresión (downscaled)
+        REG_RESCORR  = glue("D:/TIFS/downscaled_rescorr_{basename(finp)}"),  # Corrección de residuales
+        QUALITY      = glue("D:/TIFS/downscaled_quality_{basename(finp)}"),  # Coeficiente de determinación
+        RESIDUALS    = glue("D:/TIFS/downscaled_residuals_{basename(finp)}"),# Residuos
+        MODEL        = glue("D:/TIFS/downscaled_model_{basename(finp)}"),    # Parámetros de la regresión
+        SEARCH_RANGE = 0,     # Búsqueda local (por defecto)
+        SEARCH_RADIUS= 10,    # Radio de búsqueda en celdas (por defecto)
+        DW_WEIGHTING = 3,     # Función de ponderación: 3 = gaussiana (por defecto)
+        DW_IDW_POWER = 2.0,   # Potencia (por defecto)
+        DW_BANDWIDTH = 7.0    # Ancho de banda (por defecto)
+      ),
+      env = envr
+    )
+
+    
+    # Opcional: puedes chequear el resultado:
+    plot(rast(fout))
+    
+    cat("Done!\n\n")
+  }
+)
+
+```
+
+
+
